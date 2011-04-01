@@ -1,0 +1,607 @@
+#!/bin/bash
+
+# TODO Process synonyms.
+# TODO Verify user, password and tns before building and creating any files.
+# TODO Drop all objects before building.
+# TODO Add drop objects command.
+# TODO Get clean spool file.
+# TODO Put all output into build_yyyymmdd_hh24miss.log and backup it.
+# TODO After building finished, highlight the error sql results (ORA).
+# TODO Process erating_app user.
+
+# TODO Extract functions for connect to DB, find out invalid objects etc.
+# TODO Add auto tar functionality to generate .tgz(or .tar.gz) package for backup.
+# TODO Add usage: . bios.sh -t config
+# TODO Auto detect should create new user.
+# TODO Use global veriables.
+# TODO Use readonly veriables.
+
+VERSION="1.2.0"
+
+E_OPTERROR=65
+
+config_file="config.ini"
+
+# Basic preparation.
+TIMESTAMP=`date +%Y%m%d_%H%M%S`
+SHORT_TIMESTAMP=$(expr substr $TIMESTAMP 1 9);
+
+show_help_info()
+{
+    echo
+
+    echo "NAME"
+    echo "        bios V$VERSION - a tool for automaticlly building eRating DB"
+
+    echo
+
+    echo "SYNOPSIS"
+    echo "        bios [options]"
+
+    echo
+
+    echo "DESCRIPTION"
+    echo "        bios is the abbreviation BUILD IN ONE STEP, used for hand-free building DB enviroment for"
+    echo "        eRating system. It now has 2 configuration files, first config.ini is used for configuring "
+    echo "        almost all details of the enviroment, such as db username and password, game ID, whether is "
+    echo "        a autonomic operation or is a joint operation. For more info, look into config.ini; second "
+    echo "        nls.ini, used to specify the NLS_XXX enviroment variables for oracle DB. In addition to using "
+    echo "        configuration file, you can invoke bios with some options, see detail in OPTIONS."
+
+    echo
+
+    echo "OPTIONS"
+    echo "        -h, --help"
+    echo "               Show help information."
+    echo
+    echo "        --config"
+    echo "               Name of config file."
+    echo
+    echo "        --username"
+    echo "               Name of eRating DB user."
+    echo
+    echo "        --password"
+    echo "               Password for eRating DB user."
+    echo
+    echo "        --no-wrap"
+    echo "               Don't wrap package file even if the 'operation_type' configuration item is 'licensing'."
+    echo
+    echo "        -v, --version"
+    echo "               Show version info."
+
+    echo
+}
+
+unknown_options()
+{
+    echo
+    echo "*** Unknown option $1. ***"
+}
+
+unknown_parameters()
+{
+    echo
+    echo "*** Unknown parameter $1. ***"
+}
+
+update_username_configuration()
+{
+    sed -i "s:^username=.*:username=$1:g" "$config_file"
+}
+
+update_password_configuration()
+{
+    sed -i "s:^password=.*:password=$1:g" "$config_file"
+}
+
+show_version_info()
+{
+    echo
+    echo "`basename $0` V$VERSION"
+    echo
+}
+
+change_schema_for_special_game()
+{
+    # Do some special modifications for individual games.
+    # Game DongXieXiDu need special UMS_GROUP index.
+    if [ $game_id -eq $GAME_ID_OF_ERATING_DXXD ]; then
+        sqlplus "$username/$password@$tnsname" << !
+        SET ECHO on
+        @@${build_path}/alter_index_for_group_tables.sql
+        exit;
+!
+    fi
+}
+
+validates_config()
+{
+    # Validates the configurations.
+    if [ $game_id -lt $MIN_GAME_ID -o $game_id -gt $MAX_GAME_ID ]; then
+        echo "*** Invalid game ID ($game_id)"
+        clear_tmp_files "$TIMESTAMP"
+        exit 1
+    fi
+
+    if [ "x$username" = "x" ]; then
+        echo "*** Username shouldn't be empty ($username)"
+        clear_tmp_files "$TIMESTAMP"
+        exit 1
+    fi
+
+    if [ "x$password" = "x" ]; then
+        echo "*** Password shouldn't be empty ($password)"
+        clear_tmp_files "$TIMESTAMP"
+        exit 1
+    fi
+
+    if [ "x$need_create_user" != "xyes" -a "x$need_create_user" != "xno" ]; then
+        echo "*** Invalid configuration need_create_user=\"$need_create_user\" -- <yes|no>"
+        clear_tmp_files "$TIMESTAMP"
+        exit 1
+    fi
+
+    case "x$game_type" in
+        xformal|xtrial) ;;
+        *) echo "*** Invalid configuration game_type=\"$game_type\" -- <formal|trial>"
+        clear_tmp_files "$TIMESTAMP"
+        exit 1 ;;
+    esac
+
+    case "x$operation_type" in
+        xautonomy|xjoint|xlicensing) ;;
+        *) echo "*** Invalid configuration operation_type=\"$operation_type\" -- <autonomy|joint|licensing>"
+        clear_tmp_files "$TIMESTAMP"
+        exit 1 ;;
+    esac
+
+    if [ "x$operation_type" = "xjoint" ]; then
+        if [ "x$mingle_realm" != "xyes" -a "x$mingle_realm" != "xno" ]; then
+            echo "*** Invalid configuration mingle_realm=\"$mingle_realm\" -- <yes|no>"
+            clear_tmp_files "$TIMESTAMP"
+            exit 1
+        fi
+
+        if [ "x$mingle_realm" = "xyes" ]; then
+            global_unique="yes"
+        else
+            if [ "x$global_unique" != "xyes" ]; then
+                global_unique="no"
+            fi
+        fi
+
+        if [ "x$mingle_realm" = "xyes" -o "x$global_unique" = "xyes" ]; then
+            if [ ! $erating_master_username ]; then
+                echo "*** Invalid configuration erating_master_username=\"$erating_master_username\""
+                echo "*** Option \"erating_master_username\" must be not null if mingle_realm(or global_unique)=yes"
+                clear_tmp_files "$TIMESTAMP"
+                exit 1
+            fi
+        fi
+    fi
+
+    if [ "x$wrap_package" != "xyes" -a "x$wrap_package" != "xno" ]; then
+        if [ "x$operation_type" = "xlicensing" ]; then
+            wrap_package="yes"
+        else
+            wrap_package="no"
+        fi
+    fi
+}
+
+generate_plsql_files()
+{
+    for package_file in `ls *.pck | grep -v "^tmp_"`
+    do
+        tmp_package_file="$1/$package_file"
+        dos2unix -q -n "$package_file" "$tmp_package_file"
+        if [ "x$wrap_package" = "xyes" ]; then
+            wrap iname="$tmp_package_file" oname=${tmp_package_file/pck/plb} > /dev/null
+        fi
+        echo -e "$count:\tGenerated\t ${tmp_package_file/pck/plb} from $package_file"
+        count=$(( $count + 1 ))
+    done
+}
+
+generate_building_files()
+{
+    build_path="build/${username}_${TIMESTAMP}"
+    mkdir -p $build_path
+
+    cp bios $build_path
+    cp nls.ini plb.sh plb.bat $build_path
+    mv ${TIMESTAMP}_config.sh $build_path/config.ini
+
+    generate_plsql_files "$build_path"
+
+    # Modify the username and tablespace name.
+    for sql_file in `ls *.sql`
+    do
+        prefixed_sql_file="${build_path}/$sql_file"
+        cp $sql_file $prefixed_sql_file
+        notify_new_file_notice $prefixed_sql_file
+
+        if grep -q -i "\<$DEFAULT_ERATING_USERNAME\>" "$prefixed_sql_file"
+        then
+            sed -i "s:\<$DEFAULT_ERATING_USERNAME\>:$username:gi" $prefixed_sql_file
+            modify_file_notice $prefixed_sql_file " for replacing default username"
+        fi
+
+        if grep -q -i "identified by \<$DEFAULT_ERATING_PASSWORD\>" "$prefixed_sql_file"
+        then
+            sed -i "s:identified by \<$DEFAULT_ERATING_PASSWORD\>:identified by $password:gi" $prefixed_sql_file
+            modify_file_notice $prefixed_sql_file " for replacing default password"
+        fi
+
+        if grep -q -i "\<ERATING_MASTER_USERNAME\>" "$prefixed_sql_file"
+        then
+            sed -i "s:\<ERATING_MASTER_USERNAME\>:$erating_master_username:gi" $prefixed_sql_file
+            modify_file_notice $prefixed_sql_file " for replacing default ERATING_MASTER_USERNAME"
+        fi
+
+        if grep -q -i "\<ERATING_SLAVE_USERNAME\>" "$prefixed_sql_file"
+        then
+            sed -i "s:\<ERATING_SLAVE_USERNAME\>:$username:gi" $prefixed_sql_file
+            modify_file_notice $prefixed_sql_file " for replacing default ERATING_SLAVE_USERNAME"
+        fi
+
+        if grep -q -i "tablespace\s\+ERATING_USER01" "$prefixed_sql_file"
+        then
+            sed -i "s:tablespace\s\+ERATING_USER01:tablespace $tablespace_for_user:gi" $prefixed_sql_file
+            modify_file_notice $prefixed_sql_file " for replacing default tablespace erating_user01"
+        fi
+
+        if grep -q -i "tablespace\s\+ERATING_INDEX01" "$prefixed_sql_file"
+        then
+            sed -i "s:tablespace\s\+ERATING_INDEX01:tablespace $tablespace_for_index:gi" $prefixed_sql_file
+            modify_file_notice $prefixed_sql_file " for replacing default tablespace erating_index01"
+        fi
+
+        if grep -q -i "tablespace\s\+ERATING_LOG01" "$prefixed_sql_file"
+        then
+            sed -i "s:tablespace\s\+ERATING_LOG01:tablespace $tablespace_for_log:gi" $prefixed_sql_file
+            modify_file_notice $prefixed_sql_file " for replacing default tablespace erating_log01"
+        fi
+
+        if grep -q "\${GAME_ID}" "$prefixed_sql_file"; then
+            sed -i "s:\${GAME_ID}:$game_id:g" $prefixed_sql_file
+        fi
+
+        if grep -q "\${GAME_NAME}" "$prefixed_sql_file"; then
+            sed -i "s:\${GAME_NAME}:$game_name:g" $prefixed_sql_file
+        fi
+
+        if grep -q "\${GAME_TYPE}" "$prefixed_sql_file"; then
+            if [ "x$mingle_realm" = "xyes" ]; then
+                sed -i "s:\${GAME_TYPE}:T_MINGLE_REALM:g" $prefixed_sql_file
+            else
+                if [ "x$game_type" = "xformal" ]; then
+                    sed -i "s:\${GAME_TYPE}:T_FORMAL:g" $prefixed_sql_file
+                else
+                    sed -i "s:\${GAME_TYPE}:T_TRIAL:g" $prefixed_sql_file
+                fi
+            fi
+        fi
+
+        if grep -q "\${OP_TYPE}" "$prefixed_sql_file"; then
+            case $operation_type in
+                autonomy) sed -i "s:\${OP_TYPE}:T_AUTO:g" $prefixed_sql_file;;
+                joint) sed -i "s:\${OP_TYPE}:T_UNION:g" $prefixed_sql_file;;
+                licensing) sed -i "s:\${OP_TYPE}:T_OVER_SEA:g" $prefixed_sql_file;;
+                *) ;;
+            esac
+        fi
+    done
+}
+
+process_input()
+{
+    if [ $# -le 0 ]; then
+        return 0
+    fi
+
+    set -- `getopt -s bash -a -q -u -o "hv" -l "help" -l "config:" -l "username:" -l "password:" -l "version" -l "no-wrap" -- "$@"`
+    echo "`basename $0` $@"
+
+    # process options if they are there
+    while [ ! -z "$1" ]; do
+        if [ "x$1" = "x--" ]; then
+            break
+        fi
+
+        case "$1" in
+            -h|--help) show_help="yes" ;;
+            --config) shift; config_file=$1 ;;
+            --username) shift; update_username_configuration "$1" ;;
+            --password) shift; update_password_configuration "$1" ;;
+            --no-wrap) wrap_package="no" ;;
+            -v|--version) show_version="yes" ;;
+            *) unknown_options "$1"; retval=$E_OPTERROR; stop_process="yes";  break ;;
+        esac
+
+        shift
+    done
+
+    if [ "x$stop_process" = "xyes" ]; then
+        return $retval
+    fi
+
+    # process parameters after '--'
+    while [ ! -z "$1" ]; do
+        case "${1//\'/}" in
+            help) show_help="yes" ;;
+            version) show_version="yes" ;;
+            config) shift; config_file=$1 ;;
+            --) ;;
+            *) unknown_parameters "$1"; retval=$E_OPTERROR; stop_process="yes";  break ;;
+        esac
+
+        shift
+    done
+
+    if [ "x$config_file" == "x" ]; then
+        echo "        Must be give a config file. e.g. 'config.ini'."
+        return 1
+    fi
+
+    if [ ! -f "$config_file" ]; then
+        echo "        Not found config file '$config_file'"
+        return 1
+    fi
+
+    if [ "x$stop_process" = "xyes" ]; then
+        return $retval
+    fi
+
+    return 0
+}
+
+notify_new_file_notice()
+{
+    echo -e -n "Generated\t $1"
+    if [ $# -le 2 ]
+    then
+        echo -e " $2"
+    else
+        echo
+    fi
+}
+
+modify_file_notice()
+{
+    echo -e -n "Modified\t $1"
+    if [ $# -le 2 ]
+    then
+        echo -e " $2"
+    else
+        echo
+    fi
+}
+
+clear_tmp_files()
+{
+    local prefix="$1"
+    if [ ! -z $prefix ]; then
+        rm -f ${prefix}_*
+    fi
+    rm -f *PKG_*.plb
+}
+
+# Proecess options and parameters
+process_input "$@"
+result=$?
+if [ $result -ne 0 ]; then
+    show_help_info
+    clear_tmp_files "$TIMESTAMP"
+    exit $result
+fi
+
+# Show help info and exit
+if [ -n "$show_help" ]; then
+    show_help_info
+    clear_tmp_files "$TIMESTAMP"
+    exit 0
+fi
+
+# Show version info and exit
+if [ -n "$show_version" ]; then
+    show_version_info
+    clear_tmp_files "$TIMESTAMP"
+    exit 0
+fi
+
+# Remove spaces around the equal sign.
+sed "/^[^#]/s/\s*=\s*/=/g" $config_file > ${TIMESTAMP}_config.sh
+notify_new_file_notice ${TIMESTAMP}_config.sh
+
+# Load configurations and set up the enviroment.
+. ${TIMESTAMP}_config.sh
+
+export NLS_LANG
+
+validates_config
+
+generate_building_files
+
+# Create user
+#------------------------------------------------------------------------------
+# Using the specified 'username' if 'need_create_user' is true.
+if [ "x$need_create_user" = "xyes" ]
+then
+    sqlplus "$system_username/$system_password@$tnsname" << !
+        SET ECHO on
+        @@${build_path}/create_user.sql
+        exit;
+!
+fi
+
+# Create sequences and tables.
+#------------------------------------------------------------------------------
+sqlplus "$username/$password@$tnsname" << !
+    SET ECHO on
+    @@${build_path}/table.sql
+exit;
+!
+
+change_schema_for_special_game
+
+# Alter sequences and tables for joint operation.
+if [ "x$operation_type" = "xjoint" -a "x$global_unique" = "xyes" ]
+then
+    sqlplus "$system_username/$system_password@$tnsname" << !
+        SET ECHO on
+        @@${build_path}/slave_seq_ums_role.sql
+        @@${build_path}/slave_sys_role_name.sql
+
+        @@${build_path}/slave_sys_group_name.sql
+    exit;
+!
+fi
+
+# Create synonyms
+#------------------------------------------------------------------------------
+# Mock synonyms for all versions
+sqlplus "$username/$password@$tnsname" << !
+    SET ECHO on
+    @@${build_path}/synonym_mock.sql
+exit;
+!
+
+# Synonyms for autonomy operation version
+synonym_autonomy_formal()
+{
+    sqlplus "$system_username/$system_password@$tnsname" << !
+        SET ECHO on
+        @@${build_path}/synonym_autonomy_formal.sql
+    exit;
+!
+}
+
+synonym_autonomy_trial()
+{
+    sqlplus "$system_username/$system_password@$tnsname" << !
+        SET ECHO on
+        @@${build_path}/synonym_autonomy_trial.sql
+    exit;
+!
+}
+
+create_synonym_for_autonomy_version()
+{
+    case "x$game_type" in
+        xformal) synonym_autonomy_formal ;;
+        xtrial) synonym_autonomy_trial ;;
+        *) ;;
+    esac
+}
+
+# Synonyms for joint operation version
+synonym_joint()
+{
+    sqlplus "$system_username/$system_password@$tnsname" << !
+        SET ECHO on
+        @@${build_path}/synonym_joint.sql
+    exit;
+!
+}
+
+synonym_mingle_realm()
+{
+    sqlplus "$system_username/$system_password@$tnsname" << !
+        SET ECHO on
+        @@${build_path}/synonym_mingle_realm.sql
+    exit;
+!
+}
+
+create_synonym_for_joint_version()
+{
+    synonym_joint
+    if [ "x$mingle_realm" = "xyes" ]; then
+        synonym_mingle_realm
+    fi
+}
+
+case "x$operation_type" in
+    xautonomy) create_synonym_for_autonomy_version ;;
+    xjoint) create_synonym_for_joint_version ;;
+    *) ;;
+esac
+
+# Create types
+#------------------------------------------------------------------------------
+sqlplus "$username/$password@$tnsname" << !
+    SET ECHO on
+    @@${build_path}/type.sql
+exit;
+!
+
+# Create packages
+#------------------------------------------------------------------------------
+create_packages()
+{
+    local wrap_package=$1
+
+    if [ "x$wrap_package" = "xyes" ]; then
+        . plb.sh
+        sqlplus "$username/$password@$tnsname" << !
+            @@${build_path}/package_plb.sql
+        exit;
+!
+    else
+        sqlplus "$username/$password@$tnsname" << !
+            @@${build_path}/package.sql
+        exit;
+!
+    fi
+}
+
+create_packages $wrap_package
+
+# Create initial data
+#------------------------------------------------------------------------------
+sqlplus "$username/$password@$tnsname" << !
+    SET ECHO on
+    @@${build_path}/imp_init_data.sql
+exit;
+!
+
+sqlplus "$username/$password@$tnsname" << !
+    SET ECHO on
+    @@${build_path}/imp_init_option.sql
+exit;
+!
+
+sqlplus "$username/$password@$tnsname" << !
+    SET ECHO on
+    @@${build_path}/imp_init_level_stage.sql
+exit;
+!
+
+# Create views
+#------------------------------------------------------------------------------
+sqlplus "$username/$password@$tnsname" << !
+    SET ECHO on
+    @@${build_path}/view.sql
+exit;
+!
+
+
+# Validate db buiding results.
+INVALID_OBJECTS_FILE="${build_path}/${INVALID_OBJECTS_FILE}"
+sqlplus "$username/$password@$tnsname" << !
+    spool "$INVALID_OBJECTS_FILE"
+    @@${build_path}/invalid_objects.sql
+    spool off
+exit;
+!
+
+if [ -f $INVALID_OBJECTS_FILE ]; then
+    cat $INVALID_OBJECTS_FILE
+else
+    echo "### Can not find './$INVALID_OBJECTS_FILE'."
+fi
+
+# Delete all temp files.
+clear_tmp_files "$TIMESTAMP"
+
